@@ -4,397 +4,287 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/NimbleMarkets/ntcharts/barchart"
-	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
+	// "github.com/NimbleMarkets/ntcharts/linechart"
+	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/coreos/go-systemd/sdjournal"
 )
 
-var (
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#FF7CCB")).
-			Padding(0, 1).
-			AlignHorizontal(lipgloss.Center).Border(lipgloss.NormalBorder())
-	tabStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#777")).
-			Border(lipgloss.NormalBorder(), true).
-			BorderForeground(lipgloss.Color("#7D5674")).
-			Padding(0, 1)
-	activeTabStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder(), true).
-			BorderForeground(lipgloss.Color("#7D5674")).
-			Padding(0, 1)
-	logStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Padding(1, 2)
-	helpStyle = lipgloss.NewStyle().
-			Bold(true).
-			Background(lipgloss.Color("#444444")).
-			Foreground(lipgloss.Color("#FFFFFF"))
-	helpKeyStyle = lipgloss.NewStyle().
-			Bold(true).
-			Background(lipgloss.Color("#444444")).
-			Foreground(lipgloss.Color("#00FF00"))
-	helpSeparatorStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#444444")).
-				Foreground(lipgloss.Color("#888888"))
-)
+type Log struct {
+	timestamp time.Time
+	process   string
+	message   string
+	category  string
+}
 
-const (
-	Errors = iota
-	Warnings
-	Information
-	Misc
-	All
-)
+type Filter struct {
+	name      string
+	startTime string
+	endTime   string
+	process   []*regexp.Regexp
+	message   []*regexp.Regexp
+	category  string
+}
 
-type focusedInput int
-
-const (
-	logFocus focusedInput = iota
-	searchBoxFocused
-	startDateFocused
-	endDateFocused
-)
+type Tab struct {
+	name    string
+	filters []Filter
+	logs    []Log
+}
 
 type model struct {
-	width        int
-	height       int
-	activeTab    int
-	focused      focusedInput
-	searchBox    textinput.Model
-	startDate    textinput.Model
-	endDate      textinput.Model
-	searchQuery  string
-	errors       []Log
-	warnings     []Log
-	info         []Log
-	misc         []Log
-	filteredLogs []Log
-	logTable     table.Model
-	chart        barchart.Model
+	width                   int
+	height                  int
+	tabs                    []Tab
+	activeTab               int
+	keymaps                 map[string]keymap
+	countChart              barchart.Model
+	top_tab_processes_chart barchart.Model
+	tab_trend_chart         barchart.Model
+	table                   table.Model
+	logs                    []Log
+	msgSearch               textinput.Model
+	startDate               textinput.Model
+	endDate                 textinput.Model
+	processSearch           textinput.Model
+	focused                 int
+}
+
+const (
+	msgSearch = iota
+	startDate
+	endDate
+	processSearch
+	logTable
+)
+
+type keymap struct {
+	callback func(m *model) tea.Cmd
+	desc     string
 }
 
 func (m *model) Init() tea.Cmd {
-	// Initialize tables
-
-	// m.chart = barchart.New(11, 10)
-	m.chart.Draw()
-	m.initLogTable()
-	// m.initHelpTable()
+	m.countChart.Draw()
+	m.top_tab_processes_chart.Draw()
+	m.tab_trend_chart.Draw()
+	// m.tab_trend_chart.DrawXYAxisAndLabel()
 	return tea.EnterAltScreen
 }
 
-func (m *model) initLogTable() {
-	columns := []table.Column{
-		{Title: "Timestamp", Width: 20},
-		{Title: "Process", Width: 20},
-		{Title: "Message", Width: 80}, // Remaining width for message
+func (m *model) clearFocused() {
+	switch m.focused {
+	case msgSearch:
+		m.msgSearch.SetValue("")
+	case startDate:
+		m.startDate.SetValue("")
+	case endDate:
+		m.endDate.SetValue("")
+	case processSearch:
+		m.processSearch.SetValue("")
 	}
-
-	// Convert filtered logs to table rows
-	rows := make([]table.Row, len(m.filteredLogs))
-	for i, log := range m.filteredLogs {
-		rows[i] = table.Row{log.timestamp, log.process, log.message}
-	}
-
-	m.logTable = table.New(
-		table.WithColumns(columns),
-		table.WithRows(rows),
-		table.WithHeight(20),
-		table.WithFocused(m.focused == logFocus),
-	)
 }
 
-func (m model) renderHelpFooter() string {
-	var help strings.Builder
-
-	// Define help items
-	helpItems := []struct {
-		key         string
-		description string
-	}{
-		{"q", "Exit"},
-		{"Tab", "Next Tab"},
-		{"Shift-Tab", "Previous Tab"},
-		{"/", "Search"},
-		{"F", "Start Date"},
-		{"E", "End Date"},
-		{"Esc", "Clear current filter"},
-		{"Enter", "Apply"},
+func (m *model) updateFocued(msg tea.Msg) (*model, tea.Cmd) {
+	var cmd tea.Cmd
+	switch m.focused {
+	case msgSearch:
+		m.msgSearch, cmd = m.msgSearch.Update(msg)
+	case startDate:
+		m.startDate, cmd = m.startDate.Update(msg)
+	case endDate:
+		m.endDate, cmd = m.endDate.Update(msg)
+	case processSearch:
+		m.processSearch, cmd = m.processSearch.Update(msg)
 	}
-
-	separator := helpSeparatorStyle.Render(" | ")
-
-	// Create the help line
-	columnWidth := 15
-	width := 0
-	help.WriteString(helpStyle.Render("  "))
-	for i, item := range helpItems {
-		if i > 0 {
-			help.WriteString(separator)
-		}
-		if width > m.width {
-			help.WriteString("\n")
-		}
-		help.WriteString(helpKeyStyle.Render(item.key))
-		help.WriteString(helpStyle.Render(" " + item.description))
-		width += columnWidth
-	}
-
-	// Create border line
-	width = m.width
-	if width == 0 {
-		width = 80 // fallback width
-	}
-
-	// Pad the help text to full width
-	helpText := help.String()
-	padding := width - lipgloss.Width(helpText)
-	if padding > 0 {
-		helpText += helpStyle.Render(strings.Repeat(" ", padding))
-	}
-
-	return helpText
+	return m, cmd
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
-	switch m.focused {
-	case searchBoxFocused:
-		m.searchBox, cmd = m.searchBox.Update(msg)
-	case startDateFocused:
-		m.startDate, cmd = m.startDate.Update(msg)
-	case endDateFocused:
-		m.endDate, cmd = m.endDate.Update(msg)
-	}
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "q":
-			if m.focused == logFocus {
-				return m, tea.Quit
-			}
-		case "tab":
-			m.activeTab = (m.activeTab + 1) % 5
-			m.applyFilters() // Update filtered logs for new tab
-			m.initLogTable() // Reinitialize table with new data
-		case "shift+tab":
-			m.activeTab = (m.activeTab + 5 - 1) % 5
-			m.applyFilters() // Update fi5tered logs for new tab
-			m.initLogTable() // Reinitialize table with new data
-		case "/":
-			if m.focused == logFocus {
-				m.focused = searchBoxFocused
-				m.searchBox.Focus()
+		if m.focused == msgSearch || m.focused == startDate || m.focused == endDate || m.focused == processSearch {
+			if msg.String() == "enter" {
+				m.updateTab()
+				m.focused = logTable
+				m.msgSearch.Blur()
 				m.startDate.Blur()
 				m.endDate.Blur()
-			}
-		case "f":
-			if m.focused == logFocus {
-				m.focused = startDateFocused
-				m.startDate.Focus()
-				m.searchBox.Blur()
-				m.endDate.Blur()
-			}
-		case "e":
-			if m.focused == logFocus {
-				m.focused = endDateFocused
-				m.endDate.Focus()
-				m.searchBox.Blur()
+				m.processSearch.Blur()
+			} else if msg.String() == "esc" {
+				m.clearFocused()
+				m.focused = logTable
+				m.msgSearch.Blur()
 				m.startDate.Blur()
+				m.endDate.Blur()
+				m.processSearch.Blur()
+				m.updateTab()
+			} else {
+				m, cmd = m.updateFocued(msg)
 			}
-		case "esc":
-			m.clearFocusedFilter()
-			m.focused = logFocus
-			m.searchBox.Blur()
-			m.startDate.Blur()
-			m.endDate.Blur()
-			m.initLogTable() // Reinitialize table after clearing filter
-		case "enter":
-			if m.focused == searchBoxFocused || m.focused == startDateFocused || m.focused == endDateFocused {
-				m.applyFilters()
-				m.initLogTable() // Reinitialize table after applying filters
-				m.focused = logFocus
-			}
-		}
-		// Handle table navigation when focused on logs
-		if m.focused == logFocus {
-			var tableMsg tea.Msg = msg
-			m.logTable, cmd = m.logTable.Update(tableMsg)
 			return m, cmd
+		} else if keymap, ok := m.keymaps[msg.String()]; ok {
+			cmd = keymap.callback(m)
+		} else {
+			m.table, cmd = m.table.Update(msg)
 		}
-
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.initLogTable() // Reinitialize table with new dimensions
-		return m, tea.ClearScreen
+		cmd = tea.ClearScreen
 	}
-
 	return m, cmd
 }
 
 func (m model) View() string {
 	content := strings.Builder{}
-
-	// Title
-	title := lipgloss.PlaceHorizontal(m.width, lipgloss.Center, titleStyle.Render("System Log Analyzer"))
-	content.WriteString(title + "\n\n")
-
-	// Tab bar
-	var tabBar string
-	switch m.activeTab {
-	case Errors:
-		tabBar = lipgloss.JoinHorizontal(lipgloss.Top,
-			activeTabStyle.Render("Errors"),
-			tabStyle.Render("Warnings"),
-			tabStyle.Render("Information"),
-			tabStyle.Render("Misc"),
-			tabStyle.Render("All"))
-	case Warnings:
-		tabBar = lipgloss.JoinHorizontal(lipgloss.Top,
-			tabStyle.Render("Errors"),
-			activeTabStyle.Render("Warnings"),
-			tabStyle.Render("Information"),
-			tabStyle.Render("Misc"),
-			tabStyle.Render("All"))
-	case Information:
-		tabBar = lipgloss.JoinHorizontal(lipgloss.Top,
-			tabStyle.Render("Errors"),
-			tabStyle.Render("Warnings"),
-			activeTabStyle.Render("Information"),
-			tabStyle.Render("Misc"),
-			tabStyle.Render("All"))
-	case Misc:
-		tabBar = lipgloss.JoinHorizontal(lipgloss.Top,
-			tabStyle.Render("Errors"),
-			tabStyle.Render("Warnings"),
-			tabStyle.Render("Information"),
-			activeTabStyle.Render("Misc"),
-			tabStyle.Render("All"))
-	case All:
-		tabBar = lipgloss.JoinHorizontal(lipgloss.Top,
-			tabStyle.Render("Errors"),
-			tabStyle.Render("Warnings"),
-			tabStyle.Render("Information"),
-			tabStyle.Render("Misc"),
-			activeTabStyle.Render("All"))
+	// header
+	content.WriteString(
+		lipgloss.PlaceHorizontal(
+			m.width,
+			lipgloss.Center,
+			lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("111")).
+				Padding(0, 1).
+				AlignHorizontal(lipgloss.Center).Border(lipgloss.NormalBorder()).
+				Render("System Log Analyzer"),
+		),
+	)
+	content.WriteString("\n\n")
+	// inputs
+	content.WriteString("Search: " + m.msgSearch.View() + "\n\n")
+	content.WriteString("StartDate: " + m.startDate.View() + "\n\n")
+	content.WriteString("EndDate: " + m.endDate.View() + "\n\n")
+	content.WriteString("Process: " + m.processSearch.View() + "\n\n")
+	// tab bar
+	var tabBtns []string
+	tabStyle := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		Padding(0, 1).
+		BorderForeground(lipgloss.Color("11"))
+	for i, tab := range m.tabs {
+		if m.activeTab == i {
+			tabStyle = tabStyle.Foreground(lipgloss.Color("15"))
+		} else {
+			tabStyle = tabStyle.Foreground(lipgloss.Color("8"))
+		}
+		tabBtns = append(tabBtns, tabStyle.Render(tab.name+" ("+strconv.Itoa(len(tab.logs))+")"))
 	}
-	tabBar = lipgloss.JoinHorizontal(lipgloss.Center, tabBar, " ("+strconv.Itoa(len(m.filteredLogs))+")")
-	content.WriteString(tabBar + "\n\n")
+	content.WriteString(
+		lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			tabBtns...,
+		),
+	)
+	content.WriteString("\n\n")
 
-	// Search and date filters
-	content.WriteString("Search: " + m.searchBox.View() + "\n\n")
-	content.WriteString("Start Date (YYYY-MM-DD): " + m.startDate.View() + "\n")
-	content.WriteString("End Date (YYYY-MM-DD): " + m.endDate.View() + "\n\n")
-
-	// Log table
+	// table and countChart
 	border := lipgloss.NewStyle().Border(lipgloss.NormalBorder())
-	table := border.Render(m.logTable.View())
-	data := lipgloss.JoinHorizontal(lipgloss.Top, table, border.Margin(0, 0, 0, 10).Padding(1).Render(m.chart.View()))
-	content.WriteString(data)
-	// content.WriteString("\nLogs:\n")
-	// content.WriteString(m.logTable.View())
-	//
-	// // m.chart.Draw()
-	// content.WriteString("\n\nChart:\n")
-	// content.WriteString(m.chart.View())
+	content.WriteString(
+		lipgloss.JoinHorizontal(lipgloss.Top,
+			border.Render(m.table.View()),
+			border.Render(m.countChart.View()),
+		),
+	)
+	content.WriteString("\n\n")
 
-	// Help table
-	footer := lipgloss.PlaceVertical(m.height-lipgloss.Height(content.String()), lipgloss.Bottom, m.renderHelpFooter())
-	content.WriteString(footer)
-	contentStyle := lipgloss.NewStyle().MarginLeft(1)
+	// top_tab_processes_chart and tab_trend_chart
+	content.WriteString(
+		lipgloss.JoinHorizontal(lipgloss.Top,
+			border.Render(m.top_tab_processes_chart.View()),
+			border.Render(m.tab_trend_chart.View()),
+		),
+	)
+	content.WriteString("\n\n")
 
-	return contentStyle.Render(content.String())
+	return content.String()
 }
 
-func filterLogs(logs []Log, query, start, end string) []Log {
-	var result []Log
-	for _, log := range logs {
-		if query != "" && !strings.Contains(strings.ToLower(log.message), strings.ToLower(query)) {
-			continue
-		}
-		if start != "" && log.timestamp < start {
-			continue
-		}
-		if end != "" && log.timestamp > end {
-			continue
-		}
-		result = append(result, log)
+func getCategoryColor(cat string) lipgloss.Color {
+	switch cat {
+	case "Errors":
+		return lipgloss.Color("9")
+	case "Warnings":
+		return lipgloss.Color("3")
+	case "Informational":
+		return lipgloss.Color("2")
+	case "Uncategorised":
+		return lipgloss.Color("4")
 	}
-	return result
+	return lipgloss.Color("15")
 }
 
-func (m *model) clearFocusedFilter() {
-	switch m.focused {
-	case searchBoxFocused:
-		m.searchBox.SetValue("")
-	case startDateFocused:
-		m.startDate.SetValue("")
-	case endDateFocused:
-		m.endDate.SetValue("")
+func (m *model) updateTab() {
+	filter := Filter {
+		name: "temp",
+		message: []*regexp.Regexp {
+			regexp.MustCompile(m.msgSearch.Value()),
+		},
+		startTime: m.startDate.Value(),
+		endTime: m.endDate.Value(),
+		process: []*regexp.Regexp {
+			regexp.MustCompile(m.processSearch.Value()),
+		},
 	}
-	m.applyFilters()
-}
-
-func (m *model) applyFilters() {
-	var logs []Log
-	switch m.activeTab {
-	case Errors:
-		logs = m.errors
-	case Warnings:
-		logs = m.warnings
-	case Information:
-		logs = m.info
-	case Misc:
-		logs = m.misc
-	case All:
-		var all []Log
-		all = append(all, m.errors...)
-		all = append(all, m.warnings...)
-		all = append(all, m.info...)
-		all = append(all, m.misc...)
-		logs = all
+	filteredLogs := getFilteredLogs(m.tabs[m.activeTab].logs, []Filter {filter})
+	var tableRows []table.Row
+	for _, log := range filteredLogs {
+		tableRows = append(tableRows, table.Row{
+			log.timestamp.Format("Jan 02 15:04:05"),
+			log.process,
+			log.message,
+		})
 	}
-	m.filteredLogs = filterLogs(logs, m.searchBox.Value(), m.startDate.Value(), m.endDate.Value())
-}
+	m.table.SetRows(tableRows)
 
-func customFormatter(entry *sdjournal.JournalEntry) (string, error) {
-	msg, ok := entry.Fields["SYSLOG_RAW"]
-	if !ok {
-		return "", fmt.Errorf("no MESSAGE field present in journal entry")
+	m.top_tab_processes_chart.Clear()
+	m.tab_trend_chart.Clear()
+
+	if len(filteredLogs) == 0 {
+		return
 	}
-	hostname, _ := entry.Fields["_HOSTNAME"]
-	process, _ := entry.Fields["_COMM"]
+	var topProcessChartData []barchart.BarData
+	for i, process := range getTopNProcess(filteredLogs, 5) {
+		topProcessChartData = append(topProcessChartData, barchart.BarData{
+			Label: process.s,
+			Values: []barchart.BarValue{
+				{
+					Value: float64(process.count),
+					Style: lipgloss.NewStyle().Foreground(lipgloss.Color(strconv.Itoa(i + 1))),
+				},
+			},
+		})
+	}
+	m.top_tab_processes_chart.PushAll(topProcessChartData)
+	m.top_tab_processes_chart.Draw()
 
-	usec := entry.RealtimeTimestamp
-	timestamp := time.Unix(0, int64(usec)*int64(time.Microsecond)).Format("Jan 02 15:04:05")
-
-	return fmt.Sprintf("%s %s %s: %s\n", timestamp, hostname, process, msg), nil
+	var trendChartData []barchart.BarData
+	for _, trend := range getTrendValues(filteredLogs, 5) {
+		trendChartData = append(trendChartData, barchart.BarData{
+			// Label: "",
+			Values: []barchart.BarValue{
+				{
+					Value: float64(trend),
+					Style: lipgloss.NewStyle().Foreground(lipgloss.Color("15")),
+				},
+			},
+		})
+	}
+	m.tab_trend_chart.PushAll(trendChartData)
+	m.tab_trend_chart.Draw()
 }
 
 func main() {
-	searchBox := textinput.New()
-	searchBox.Placeholder = "Enter keyword"
-	searchBox.Width = 30
-
-	startDate := textinput.New()
-	startDate.Placeholder = "YYYY-MM-DD"
-	startDate.Width = 12
-
-	endDate := textinput.New()
-	endDate.Placeholder = "YYYY-MM-DD"
-	endDate.Width = 12
-
 	var readers []io.Reader
 	for _, filePath := range os.Args[1:] {
 		logFile, err := os.Open(filePath)
@@ -405,87 +295,163 @@ func main() {
 		readers = append(readers, logFile)
 	}
 	if len(readers) == 0 {
-		// journalReader, err := sdjournal.NewJournalReader(sdjournal.JournalReaderConfig{
-		// 	Formatter: customFormatter,
-		// })
-		// if err != nil {
-		// 	fmt.Println("No valid file paths provided and could not read system journal")
-		// }
-		// readers = append(readers, journalReader)
-		fmt.Println("No valid file paths provided")
-		os.Exit(0)
+		journalReader, err := sdjournal.NewJournalReader(sdjournal.JournalReaderConfig{
+			Formatter: func(entry *sdjournal.JournalEntry) (string, error) {
+				msg, ok := entry.Fields["MESSAGE"]
+				if !ok {
+					return "", fmt.Errorf("no MESSAGE field present in journal entry")
+				}
+				hostname, _ := entry.Fields["_HOSTNAME"]
+				process, _ := entry.Fields["_COMM"]
+
+				usec := entry.RealtimeTimestamp
+				timestamp := time.Unix(0, int64(usec)*int64(time.Microsecond)).Format("Jan 02 15:04:05")
+
+				return fmt.Sprintf("%s %s %s: %s\n", timestamp, hostname, process, msg), nil
+			},
+		})
+		if err != nil {
+			fmt.Println("No valid file paths provided and could not read system journal")
+		}
+		readers = append(readers, journalReader)
 	}
 
 	multiReader := io.MultiReader(readers...)
-	logs := GetCategorisedLogs(multiReader)
 
-	d1 := barchart.BarData{
-		Label: "Error",
-		Values: []barchart.BarValue{
-			{
-				Name:  "Errors",
-				Value: float64(len(logs["errors"])),
-				Style: lipgloss.NewStyle().Foreground(lipgloss.Color("9")),
+	parsedLogs := GetParsedLogs(multiReader)
+	logs := GetCategorisedLogs(parsedLogs)
+
+	categoryFilters := []Filter{{
+		name:     "Errors",
+		category: "error",
+	}, {
+		name:     "Warnings",
+		category: "warn",
+	}, {
+		name:     "Informational",
+		category: "info",
+	}, {
+		name:     "Uncategorised",
+		category: "misc",
+	}, {
+		name: "All",
+	}}
+
+	var tabs []Tab
+	var countChartData []barchart.BarData
+	for _, filter := range categoryFilters {
+		tabLogs := getFilteredLogs(logs, []Filter{filter})
+		tabs = append(tabs, Tab{
+			name:    filter.name,
+			filters: []Filter{filter},
+			logs:    tabLogs,
+		})
+		countChartData = append(countChartData, barchart.BarData{
+			Label: filter.name,
+			Values: []barchart.BarValue{
+				{
+					Value: float64(len(tabLogs)),
+					Style: lipgloss.NewStyle().Foreground(getCategoryColor(filter.name)),
+				},
 			},
-		},
+		})
 	}
-	d2 := barchart.BarData{
-		Label: "Warn",
-		Values: []barchart.BarValue{
-			{
-				Value: float64(len(logs["warnings"])),
-				Style: lipgloss.NewStyle().Foreground(lipgloss.Color("11")),
-			},
-		},
-	}
-	d3 := barchart.BarData{
-		Label: "Info",
-		Values: []barchart.BarValue{
-			{
-				Value: float64(len(logs["infos"])),
-				Style: lipgloss.NewStyle().Foreground(lipgloss.Color("10")),
-			},
-		},
-	}
-	d4 := barchart.BarData{
-		Label: "Misc",
-		Values: []barchart.BarValue{
-			{
-				Value: float64(len(logs["misc"])),
-				Style: lipgloss.NewStyle().Foreground(lipgloss.Color("4")),
-			},
-		},
-	}
-	d5 := barchart.BarData{
-		Label: "All",
-		Values: []barchart.BarValue{
-			{
-				Value: float64(len(logs["info"]) + len(logs["warnings"]) + len(logs["errors"]) + len(logs["misc"])),
-				Style: lipgloss.NewStyle().Foreground(lipgloss.Color("15")),
-			},
-		},
-	}
+
+	msgSearchBox := textinput.New()
+	msgSearchBox.Width = 30
+	startDateBox := textinput.New()
+	startDateBox.Width = 30
+	endDateBox := textinput.New()
+	endDateBox.Width = 30
+	processSearchBox := textinput.New()
+	processSearchBox.Width = 30
 
 	m := model{
-		searchBox: searchBox,
-		startDate: startDate,
-		endDate:   endDate,
-		errors:    logs["errors"],
-		warnings:  logs["warnings"],
-		info:      logs["infos"],
-		misc:      logs["misc"],
-		chart: barchart.New(
-			32,
-			18,
-			barchart.WithDataSet([]barchart.BarData{d1, d2, d3, d4, d5}),
+		activeTab:  0,
+		focused: logTable,
+		msgSearch: msgSearchBox,
+		startDate: startDateBox,
+		endDate: endDateBox,
+		processSearch: processSearchBox,
+		countChart: barchart.New(64, 20, barchart.WithDataSet(countChartData)),
+		top_tab_processes_chart: barchart.New(
+			64,
+			16,
+			barchart.WithHorizontalBars(),
 		),
+		tab_trend_chart: barchart.New(64, 16, barchart.WithNoAxis()),
+		table: table.New(
+			table.WithHeight(20),
+			table.WithColumns([]table.Column{
+				{Title: "Timestamp", Width: 16},
+				{Title: "Process", Width: 20},
+				{Title: "Message", Width: 80},
+			})),
+		logs: logs,
+		tabs: tabs,
+		keymaps: map[string]keymap{
+			"q": {
+				desc: "quit",
+				callback: func(m *model) tea.Cmd {
+					return tea.Quit
+				},
+			},
+			"tab": {
+				desc: "next tab",
+				callback: func(m *model) tea.Cmd {
+					m.activeTab = (m.activeTab + 1) % len(m.tabs)
+					m.updateTab()
+					return nil
+				},
+			},
+			"shift+tab": {
+				desc: "previous tab",
+				callback: func(m *model) tea.Cmd {
+					m.activeTab = (m.activeTab + len(m.tabs) - 1) % len(tabs)
+					m.updateTab()
+					return nil
+				},
+			},
+			"/": {
+				desc: "search message",
+				callback: func(m *model) tea.Cmd {
+					m.focused = msgSearch
+					m.msgSearch.Focus()
+					return nil
+				},
+			},
+			"f": {
+				desc: "start date",
+				callback: func(m *model) tea.Cmd {
+					m.focused = startDate
+					m.startDate.Focus()
+					return nil
+				},
+			},
+			"e": {
+				desc: "end date",
+				callback: func(m *model) tea.Cmd {
+					m.focused = endDate
+					m.endDate.Focus()
+					return nil
+				},
+			},
+			"p": {
+				desc: "search process",
+				callback: func(m *model) tea.Cmd {
+					m.focused = processSearch
+					m.processSearch.Focus()
+					return nil
+				},
+			},
+		},
 	}
 
-	m.applyFilters() // Initialize filtered logs
+	m.updateTab()
 
 	p := tea.NewProgram(&m)
 	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v", err)
+		fmt.Fprintf(os.Stderr, "[ERROR] %v", err)
 		os.Exit(1)
 	}
 }
